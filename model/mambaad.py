@@ -18,11 +18,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from einops import rearrange, repeat
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from timm.layers import DropPath, to_2tuple, trunc_normal_
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
 import numpy as np
 from hilbert import decode, encode
 from pyzorder import ZOrderIndexer
+
+from mamba_layers import VMAMBA2Block
 
 # ========== Decoder ==========
 def conv3x3(in_planes, out_planes, stride = 1, groups = 1, dilation = 1):
@@ -301,6 +303,291 @@ class SS2D(nn.Module):
             out = self.dropout(out)
         return out
 
+
+class SS2DMV(nn.Module):
+    def __init__(
+            self,
+            d_model,
+            d_state=16,
+            d_conv=3,
+            expand=2,
+            dt_rank="auto",
+            dt_min=0.001,
+            dt_max=0.1,
+            dt_init="random",
+            dt_scale=1.0,
+            dt_init_floor=1e-4,
+            dropout=0.,
+            conv_bias=True,
+            bias=False,
+            device=None,
+            dtype=None,
+            size=8,
+            scan_type='scan',
+            num_direction=8,
+            **kwargs,
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = int(self.expand * self.d_model)
+        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
+
+        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
+        self.conv2d_x = nn.Conv2d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            groups=self.d_inner,
+            bias=conv_bias,
+            kernel_size=d_conv,
+            padding=(d_conv - 1) // 2,
+            **factory_kwargs,
+        )
+        self.conv2d_z = nn.Conv2d(
+			in_channels=self.d_inner,
+			out_channels=self.d_inner,
+			groups=self.d_inner,
+			bias=conv_bias,
+			kernel_size=d_conv,
+			padding=(d_conv - 1) // 2,
+			**factory_kwargs,
+		)
+        self.act = nn.SiLU()
+        self.num_direction = num_direction
+
+        x_proj_weight = [nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs).weight for _ in range(self.num_direction)]
+        self.x_proj_weight = nn.Parameter(torch.stack(x_proj_weight, dim=0))
+        dt_projs = [self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor, **factory_kwargs) for _ in range(self.num_direction)]
+        self.dt_projs_weight = nn.Parameter(torch.stack([dt_proj.weight for dt_proj in dt_projs], dim=0))
+        self.dt_projs_bias = nn.Parameter(torch.stack([dt_proj.bias for dt_proj in dt_projs], dim=0))
+
+        self.A_logs = self.A_log_init(self.d_state, self.d_inner, copies=self.num_direction, merge=True)  # (K=4, D, N)
+        self.Ds = self.D_init(self.d_inner, copies=self.num_direction, merge=True)  # (K=4, D, N)
+
+        self.out_norm_x = nn.LayerNorm(self.d_inner)
+        self.out_norm_z = nn.LayerNorm(self.d_inner)
+        self.out_proj = nn.Linear(self.d_inner * 2, self.d_model, bias=bias, **factory_kwargs)
+        self.dropout = nn.Dropout(dropout) if dropout > 0. else None
+        self.scans = SCANS(size=size, scan_type=scan_type)
+
+    @staticmethod
+    def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4,
+                **factory_kwargs):
+        dt_proj = nn.Linear(dt_rank, d_inner, bias=True, **factory_kwargs)
+        # Initialize special dt projection to preserve variance at initialization
+        dt_init_std = dt_rank ** -0.5 * dt_scale
+        if dt_init == "constant":
+            nn.init.constant_(dt_proj.weight, dt_init_std)
+        elif dt_init == "random":
+            nn.init.uniform_(dt_proj.weight, -dt_init_std, dt_init_std)
+        else:
+            raise NotImplementedError
+        # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
+        dt = torch.exp(
+            torch.rand(d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            dt_proj.bias.copy_(inv_dt)
+        # Our initialization would set all Linear.bias to zero, need to mark this one as _no_reinit
+        dt_proj.bias._no_reinit = True
+        return dt_proj
+
+    @staticmethod
+    def A_log_init(d_state, d_inner, copies=1, device=None, merge=True):
+        # S4D real initialization
+        A = repeat(
+            torch.arange(1, d_state + 1, dtype=torch.float32, device=device),
+            "n -> d n",
+            d=d_inner,
+        ).contiguous()
+        A_log = torch.log(A)  # Keep A_log in fp32
+        if copies > 1:
+            A_log = repeat(A_log, "d n -> r d n", r=copies)
+            if merge:
+                A_log = A_log.flatten(0, 1)
+        A_log = nn.Parameter(A_log)
+        A_log._no_weight_decay = True
+        return A_log
+
+    @staticmethod
+    def D_init(d_inner, copies=1, device=None, merge=True):
+        # D "skip" parameter
+        D = torch.ones(d_inner, device=device)
+        if copies > 1:
+            D = repeat(D, "n1 -> r n1", r=copies)
+            if merge:
+                D = D.flatten(0, 1)
+        D = nn.Parameter(D)  # Keep in fp32
+        D._no_weight_decay = True
+        return D
+
+    def forward_core(self, x: torch.Tensor):
+        self.selective_scan = selective_scan_fn
+        B, C, H, W = x.shape
+        L = H * W
+        K = self.num_direction
+        xs = []
+        if K >= 2:
+            xs.append(self.scans.encode(x.view(B, -1, L)))
+        if K >= 4:
+            xs.append(self.scans.encode(torch.transpose(x, dim0=2, dim1=3).contiguous().view(B, -1, L)))
+        if K >= 8:
+            xs.append(self.scans.encode(torch.rot90(x, k=1, dims=(2, 3)).contiguous().view(B, -1, L)))
+            xs.append(self.scans.encode(torch.transpose(torch.rot90(x, k=1, dims=(2, 3)), dim0=2, dim1=3).contiguous().view(B, -1, L)))
+        xs = torch.stack(xs,dim=1).view(B, K // 2, -1, L)
+        xs = torch.cat([xs, torch.flip(xs, dims=[-1])], dim=1)
+
+        x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
+        dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
+        dts = torch.einsum("b k r l, k d r -> b k d l", dts.view(B, K, -1, L), self.dt_projs_weight)
+
+        xs = xs.float().view(B, -1, L)  # (b, k * d, l)
+        dts = dts.contiguous().float().view(B, -1, L)  # (b, k * d, l)
+        Bs = Bs.float().view(B, K, -1, L)  # (b, k, d_state, l)
+        Cs = Cs.float().view(B, K, -1, L)  # (b, k, d_state, l)
+        Ds = self.Ds.float().view(-1)  # (k * d)
+        As = -torch.exp(self.A_logs.float()).view(-1, self.d_state)  # (k * d, d_state)
+        dt_projs_bias = self.dt_projs_bias.float().view(-1)  # (k * d)
+
+        out_y = self.selective_scan(
+            xs, dts,
+            As, Bs, Cs, Ds, z=None,
+            delta_bias=dt_projs_bias,
+            delta_softplus=True,
+            return_last_state=False,
+        ).view(B, K, -1, L)
+        assert out_y.dtype == torch.float
+        # out_y = xs
+
+        inv_y = torch.flip(out_y[:, K // 2:K], dims=[-1]).view(B, K // 2, -1, L)
+        ys = []
+        if K >= 2:
+            ys.append(self.scans.decode(out_y[:, 0]))
+            ys.append(self.scans.decode(inv_y[:, 0]))
+        if K >= 4:
+            ys.append(torch.transpose(self.scans.decode(out_y[:, 1]).view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L))
+            ys.append(torch.transpose(self.scans.decode(inv_y[:, 1]).view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L))
+        if K >= 8:
+            ys.append(torch.rot90(self.scans.decode(out_y[:, 2]).view(B, -1, W, H), k=3, dims=(2,3)).contiguous().view(B, -1, L))
+            ys.append(torch.rot90(self.scans.decode(inv_y[:, 2]).view(B, -1, W, H), k=3, dims=(2,3)).contiguous().view(B, -1, L))
+            ys.append(torch.rot90(torch.transpose(self.scans.decode(out_y[:, 3]).view(B, -1, W, H), dim0=2, dim1=3), k=3, dims=(2,3)).contiguous().view(B, -1, L))
+            ys.append(torch.rot90(torch.transpose(self.scans.decode(inv_y[:, 3]).view(B, -1, W, H), dim0=2, dim1=3), k=3, dims=(2,3)).contiguous().view(B, -1, L))
+        y = sum(ys)
+        return y
+
+    def forward(self, x: torch.Tensor, **kwargs):
+        B, H, W, C = x.shape
+        xz = self.in_proj(x)
+        x, z = xz.chunk(2, dim=-1)  # (b, h, w, d)
+        x = x.permute(0, 3, 1, 2).contiguous()
+        z = z.permute(0, 3, 1, 2).contiguous()
+        x = self.act(self.conv2d_x(x))  # (b, d, h, w)
+        z = self.act(self.conv2d_z(z))
+        y = self.forward_core(x)
+        y = torch.transpose(y, dim0=1, dim1=2).contiguous().view(B, H, W, -1)
+        z = z.permute(0, 2, 3, 1).contiguous()
+        y = self.out_norm_x(y)
+        z = self.out_norm_z(z)
+        y = torch.cat([y, z], dim=-1)
+        out = self.out_proj(y)
+        if self.dropout is not None:
+            out = self.dropout(out)
+        return out
+
+
+class ConvBNSSMBlock2(nn.Module):
+    def __init__(
+			self,
+			hidden_dim: int = 0,
+			drop_path: float = 0,
+			norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+			attn_drop_rate: float = 0,
+			d_state: int = 64,
+			depth: int = 2,
+			size: int = 8,
+			scan_type: str = 'scan',
+			num_direction: int = 8,
+			**kwargs,
+	):
+        super().__init__()
+        self.smm_blocks = nn.ModuleList([
+            VMAMBA2Block(dim=hidden_dim, num_heads=8, drop_path=drop_path, norm_layer=norm_layer,
+                         drop=attn_drop_rate, d_state=d_state, size=size, scan_type=scan_type, num_direction=num_direction,**kwargs)
+            for i in range(depth)])
+        self.conv1b3 = nn.Sequential(
+            nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1, stride=1),
+            nn.InstanceNorm2d(hidden_dim),
+            nn.SiLU(),
+        )
+        self.conv1a3 = nn.Sequential(
+            nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1, stride=1),
+            nn.InstanceNorm2d(hidden_dim),
+            nn.SiLU(),
+        )
+        self.conv1b5 = nn.Sequential(
+            nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1, stride=1),
+            nn.InstanceNorm2d(hidden_dim),
+            nn.SiLU(),
+        )
+        self.conv1a5 = nn.Sequential(
+            nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1, stride=1),
+            nn.InstanceNorm2d(hidden_dim),
+            nn.SiLU(),
+        )
+        self.conv33 = nn.Sequential(
+            nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=3, stride=1, padding=1, bias=False,
+                      groups=hidden_dim),
+            nn.InstanceNorm2d(hidden_dim),
+            nn.SiLU(),
+        )
+        self.conv55 = nn.Sequential(
+            nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=5, stride=1, padding=2, bias=False,
+                      groups=hidden_dim),
+            nn.InstanceNorm2d(hidden_dim),
+            nn.SiLU(),
+        )
+        self.conv77 = nn.Sequential(
+            nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=7, stride=1, padding=3, bias=False,
+                      groups=hidden_dim),
+            nn.InstanceNorm2d(hidden_dim),
+            nn.SiLU(),
+        )
+        self.finalconv11 = nn.Conv2d(in_channels=hidden_dim * 3, out_channels=hidden_dim, kernel_size=1, stride=1)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        """
+        initialization
+        """
+        if isinstance(m, nn.Conv2d):
+            fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+            fan_out //= m.groups
+            m.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
+            if m.bias is not None:
+                m.bias.data.zero_()
+        # elif isinstance(m, nn.InstanceNorm2d):
+        # 	m.weight.data.fill_(1)
+        # 	m.bias.data.zero_()
+
+    def forward(self, input: torch.Tensor):
+        input_ = input.permute(0, 3, 1, 2).contiguous()
+        out_ssm = input_
+        for blk in self.smm_blocks:
+            out_ssm = blk(out_ssm)
+        input_conv = input_
+        out_77 = self.conv1a3(self.conv77(self.conv1b3(input_conv)))
+        out_55 = self.conv1a5(self.conv55(self.conv1b5(input_conv)))
+        output = torch.cat((out_ssm, out_55, out_77), dim=1)
+        output = self.finalconv11(output).permute(0, 2, 3, 1).contiguous()
+        return output + input
+
+
 class VSSBlock(nn.Module):
     def __init__(
         self,
@@ -344,40 +631,40 @@ class ConvBNSSMBlock(nn.Module):
 		self.conv1b3 = nn.Sequential(
 			nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1, stride=1),
 			nn.InstanceNorm2d(hidden_dim),
-			nn.SiLU(),
+			nn.SiLU(inplace=True),
 		)
 		self.conv1a3 = nn.Sequential(
 			nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1, stride=1),
 			nn.InstanceNorm2d(hidden_dim),
-			nn.SiLU(),
+			nn.SiLU(inplace=True),
 		)
 		self.conv1b5 = nn.Sequential(
 			nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1, stride=1),
 			nn.InstanceNorm2d(hidden_dim),
-			nn.SiLU(),
+			nn.SiLU(inplace=True),
 		)
 		self.conv1a5 = nn.Sequential(
 			nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1, stride=1),
 			nn.InstanceNorm2d(hidden_dim),
-			nn.SiLU(),
+			nn.SiLU(inplace=True),
 		)
 		self.conv33 = nn.Sequential(
 			nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=3, stride=1, padding=1, bias=False,
 					  groups=hidden_dim),
 			nn.InstanceNorm2d(hidden_dim),
-			nn.SiLU(),
+			nn.SiLU(inplace=True),
 		)
 		self.conv55 = nn.Sequential(
 			nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=5, stride=1, padding=2, bias=False,
 					  groups=hidden_dim),
 			nn.InstanceNorm2d(hidden_dim),
-			nn.SiLU(),
+			nn.SiLU(inplace=True),
 		)
 		self.conv77 = nn.Sequential(
 			nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=7, stride=1, padding=3, bias=False,
 					  groups=hidden_dim),
 			nn.InstanceNorm2d(hidden_dim),
-			nn.SiLU(),
+			nn.SiLU(inplace=True),
 		)
 		self.finalconv11 = nn.Conv2d(in_channels=hidden_dim * 3, out_channels=hidden_dim, kernel_size=1, stride=1)
 		self.apply(self._init_weights)
@@ -440,7 +727,7 @@ class VSSLayer_up(nn.Module):
 
 		if depth % 3 == 0:
 			self.blocks = nn.ModuleList([
-				ConvBNSSMBlock(
+				ConvBNSSMBlock2(
 					hidden_dim=dim,
 					drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
 					norm_layer=norm_layer,
@@ -454,7 +741,7 @@ class VSSLayer_up(nn.Module):
 				for i in range(depth//3)])
 		elif depth % 2 == 0:
 			self.blocks = nn.ModuleList([
-				ConvBNSSMBlock(
+				ConvBNSSMBlock2(
 					hidden_dim=dim,
 					drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
 					norm_layer=norm_layer,

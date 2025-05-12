@@ -54,7 +54,7 @@ class MVTecSolver(object):
 
 
 if __name__ == '__main__':
-    # runner = MVTecSolver(root='data/mvtec', is2D=True)
+    runner = MVTecSolver(root='data/mvtec', is2D=True)
     # runner.run()
-    runner = MVTecSolver(root='data/mvtec3d', is2D=False)
+    #runner = MVTecSolver(root='data/mvtec3d', is2D=False)
     runner.run()

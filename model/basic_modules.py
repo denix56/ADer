@@ -9,7 +9,7 @@ from functools import partial
 from einops import rearrange, reduce
 from timm.layers.weight_init import trunc_normal_
 from timm.layers.activations import *
-from timm.models.layers import DropPath
+from timm.layers import DropPath
 from timm.models._efficientnet_builder import _parse_ksize
 
 

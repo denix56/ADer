@@ -69,7 +69,7 @@ class cfg(cfg_common, cfg_dataset_default, cfg_model_mambaad):
 		self.model_s = dict(
 			depths_decoder=[3, 4, 6, 3],
 			scan_type='hilbert',
-			num_direction=8,
+			num_direction=2,
 		)
 		self.model = Namespace()
 		self.model.name = 'mambaad'
@@ -99,6 +99,7 @@ class cfg(cfg_common, cfg_dataset_default, cfg_model_mambaad):
 
 		self.trainer.data.batch_size = self.batch_train
 		self.trainer.data.batch_size_per_gpu_test = self.batch_test_per
+		#self.trainer.scaler = 'native'
 
 		# ==> loss
 		self.loss.loss_terms = [

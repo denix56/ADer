@@ -5,7 +5,7 @@ import os
 import torch.nn as nn
 import cv2
 from PIL import Image
-import accimage
+#import accimage
 import torchvision
 import torchvision.transforms as transforms
 from skimage import color
@@ -64,19 +64,19 @@ def pil_loader_L(path):
             continue
     return img
 
-def accimage_loader(path):
-    wait_for_path(path)
-
-    img = None
-    is_ok = False
-    while not is_ok:
-        try:
-            img = accimage.Image(path)
-            is_ok = True
-        except:
-            time.sleep(1)
-            continue
-    return img
+# def accimage_loader(path):
+#     wait_for_path(path)
+#
+#     img = None
+#     is_ok = False
+#     while not is_ok:
+#         try:
+#             img = accimage.Image(path)
+#             is_ok = True
+#         except:
+#             time.sleep(1)
+#             continue
+#     return img
 
 
 def get_img_loader(loader_type):
@@ -87,8 +87,7 @@ def get_img_loader(loader_type):
     elif loader_type == 'pil_L':
         return pil_loader_L
     elif loader_type == 'accimage':
-        torchvision.set_image_backend('accimage')
-        return accimage_loader
+        raise NotImplementedError
     else:
         raise ValueError('invalid image loader type: {}'.format(loader_type))
 

@@ -6,7 +6,7 @@ import logging
 import shutil
 import argparse
 import torch
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 
 
 def t2np(tensor):

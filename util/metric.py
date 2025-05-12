@@ -89,6 +89,7 @@ class Evaluator(object):
             score_max = max(pr_sp_max) + self.boundary
             anomap_min = pr_px.min()
             anomap_max = pr_px.max()
+            print(score_min, score_max, anomap_min, anomap_max)
             accum = EvalAccumulatorCuda(score_min, score_max, anomap_min, anomap_max, skip_pixel_aupro=False, nstrips=50)
             accum.add_anomap_batch(torch.tensor(pr_px).cuda(non_blocking=True),
                                    torch.tensor(gt_px.astype(np.uint8)).cuda(non_blocking=True))
